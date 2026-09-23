@@ -1,48 +1,100 @@
+import base64
+import hashlib
+import hmac
 import io
 import os
+import secrets
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, date
+from urllib.parse import urlparse
 
 import pandas as pd
+import pyotp
 import qrcode
 import streamlit as st
+from cryptography.fernet import Fernet, InvalidToken
 from PIL import Image, ImageDraw, ImageFont
 
-# -----------------------------
+# ============================================================
 # PAGE CONFIG
-# -----------------------------
+# ============================================================
 st.set_page_config(
-    page_title="Event Identity & QR Management",
-    page_icon="🎫",
+    page_title="AirNexus Secure Identity Verification",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# -----------------------------
-# CONFIGURATION
-# -----------------------------
 DB_FILE = "event_identity.db"
 
+# ============================================================
+# SECRETS / SECURITY CONFIG
+# ============================================================
 def get_secret(name, default=""):
     try:
-        return st.secrets.get(name, default)
+        value = st.secrets.get(name, default)
+        return str(value) if value is not None else default
     except Exception:
         return default
 
 APP_BASE_URL = get_secret("APP_BASE_URL", "").strip().rstrip("/")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "admin123")
+ADMIN_TOTP_SECRET = get_secret("ADMIN_TOTP_SECRET", "").strip()
+APP_ENCRYPTION_KEY = get_secret("APP_ENCRYPTION_KEY", "").strip()
+LIVE_SECURITY_SECRET = get_secret("LIVE_SECURITY_SECRET", "").strip()
 
-# -----------------------------
+def derive_fernet_key():
+    """
+    Best practice: set APP_ENCRYPTION_KEY in Streamlit Secrets.
+    Fallback derives a stable key from ADMIN_PASSWORD so encrypted QR tokens
+    remain decryptable after app restarts.
+    """
+    if APP_ENCRYPTION_KEY:
+        try:
+            # Validate supplied Fernet key.
+            Fernet(APP_ENCRYPTION_KEY.encode())
+            return APP_ENCRYPTION_KEY.encode()
+        except Exception:
+            st.error("APP_ENCRYPTION_KEY in Streamlit Secrets is invalid.")
+            st.stop()
+
+    digest = hashlib.sha256(("airnexus:" + ADMIN_PASSWORD).encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)
+
+FERNET = Fernet(derive_fernet_key())
+
+def get_live_secret_bytes():
+    if LIVE_SECURITY_SECRET:
+        return LIVE_SECURITY_SECRET.encode("utf-8")
+    return hashlib.sha256(("live:" + ADMIN_PASSWORD).encode("utf-8")).digest()
+
+LIVE_SECRET = get_live_secret_bytes()
+
+def secure_equal(a, b):
+    return hmac.compare_digest(str(a), str(b))
+
+# ============================================================
 # DATABASE
-# -----------------------------
+# ============================================================
 def get_connection():
-    return sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def table_columns(conn, table_name):
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row["name"] for row in rows}
+
+def ensure_column(conn, table_name, column_name, definition):
+    cols = table_columns(conn, table_name)
+    if column_name not in cols:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 def init_db():
     conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
+
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS members (
             id TEXT PRIMARY KEY,
@@ -62,363 +114,642 @@ def init_db():
         )
         """
     )
-    conn.commit()
-    conn.close()
 
-def add_member(data):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
+    # Migrate earlier database versions safely.
+    ensure_column(conn, "members", "photo", "BLOB")
+    ensure_column(conn, "members", "qr_token_hash", "TEXT")
+    ensure_column(conn, "members", "qr_token_enc", "TEXT")
+    ensure_column(conn, "members", "expiry_date", "TEXT")
+    ensure_column(conn, "members", "issue_version", "INTEGER DEFAULT 1")
+    ensure_column(conn, "members", "last_reissued_at", "TEXT")
+    ensure_column(conn, "members", "updated_at", "TEXT")
+
+    conn.execute(
         """
-        INSERT INTO members (
-            id, card_id, full_name, category, position, department,
-            organization, email, phone, emergency_contact, blood_group,
-            status, notes, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["id"],
-            data["card_id"],
-            data["full_name"],
-            data["category"],
-            data["position"],
-            data["department"],
-            data["organization"],
-            data["email"],
-            data["phone"],
-            data["emergency_contact"],
-            data["blood_group"],
-            data["status"],
-            data["notes"],
-            data["created_at"],
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-def update_member(member_id, data):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
+        CREATE TABLE IF NOT EXISTS scan_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            member_id TEXT,
+            card_id TEXT,
+            scan_time TEXT NOT NULL,
+            verification_id TEXT NOT NULL,
+            result TEXT NOT NULL
+        )
         """
-        UPDATE members SET
-            card_id = ?,
-            full_name = ?,
-            category = ?,
-            position = ?,
-            department = ?,
-            organization = ?,
-            email = ?,
-            phone = ?,
-            emergency_contact = ?,
-            blood_group = ?,
-            status = ?,
-            notes = ?
-        WHERE id = ?
-        """,
-        (
-            data["card_id"],
-            data["full_name"],
-            data["category"],
-            data["position"],
-            data["department"],
-            data["organization"],
-            data["email"],
-            data["phone"],
-            data["emergency_contact"],
-            data["blood_group"],
-            data["status"],
-            data["notes"],
-            member_id,
-        ),
     )
-    conn.commit()
-    conn.close()
 
-def delete_member(member_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM members WHERE id = ?", (member_id,))
-    conn.commit()
-    conn.close()
-
-def get_member(member_id):
-    conn = get_connection()
-    df = pd.read_sql_query(
-        "SELECT * FROM members WHERE id = ?",
-        conn,
-        params=(member_id,),
-    )
-    conn.close()
-    if df.empty:
-        return None
-    return df.iloc[0].to_dict()
-
-def get_all_members():
-    conn = get_connection()
-    df = pd.read_sql_query(
+    conn.execute(
         """
-        SELECT * FROM members
-        ORDER BY
-            CASE WHEN category = 'Executive Council' THEN 1
-                 WHEN category = 'Organizer' THEN 2
-                 ELSE 3 END,
-            full_name
-        """,
-        conn,
+        CREATE TABLE IF NOT EXISTS admin_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            member_id TEXT,
+            card_id TEXT,
+            action_time TEXT NOT NULL,
+            details TEXT
+        )
+        """
     )
+
+    conn.commit()
     conn.close()
-    return df
 
 init_db()
 
-# -----------------------------
-# HELPERS
-# -----------------------------
-def build_profile_url(member_id):
+# ============================================================
+# QR TOKEN SECURITY
+# ============================================================
+def new_qr_token():
+    # 32 random bytes encoded URL-safe. This is not guessable or sequential.
+    return secrets.token_urlsafe(32)
+
+def hash_token(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def encrypt_token(token):
+    return FERNET.encrypt(token.encode("utf-8")).decode("utf-8")
+
+def decrypt_token(enc):
+    if not enc:
+        return None
+    try:
+        return FERNET.decrypt(enc.encode("utf-8")).decode("utf-8")
+    except (InvalidToken, ValueError, TypeError):
+        return None
+
+def build_verification_url(token):
     if APP_BASE_URL:
-        return f"{APP_BASE_URL}/?member={member_id}"
-    return f"http://localhost:8501/?member={member_id}"
+        return f"{APP_BASE_URL}/?verify={token}"
+    return f"http://localhost:8501/?verify={token}"
 
-def make_qr_image(member_id):
-    profile_url = build_profile_url(member_id)
-
+def make_qr_from_token(token):
+    url = build_verification_url(token)
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
         box_size=10,
         border=4,
     )
-    qr.add_data(profile_url)
+    qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    return img, profile_url
+    image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    return image, url
 
-def image_to_png_bytes(img):
-    buffer = io.BytesIO()
-    img.save(buffer, format="PNG")
-    return buffer.getvalue()
+def png_bytes(img):
+    buff = io.BytesIO()
+    img.save(buff, format="PNG")
+    return buff.getvalue()
 
-def make_id_card(member):
-    width, height = 1050, 650
-    card = Image.new("RGB", (width, height), "white")
-    draw = ImageDraw.Draw(card)
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+def add_audit(action, member_id=None, card_id=None, details=""):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO admin_audit(action, member_id, card_id, action_time, details)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            action,
+            member_id,
+            card_id,
+            datetime.now().isoformat(timespec="seconds"),
+            details,
+        ),
+    )
+    conn.commit()
+    conn.close()
 
-    try:
-        title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 52)
-        name_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 45)
-        normal_font = ImageFont.truetype("DejaVuSans.ttf", 32)
-        small_font = ImageFont.truetype("DejaVuSans.ttf", 25)
-    except Exception:
-        title_font = ImageFont.load_default()
-        name_font = ImageFont.load_default()
-        normal_font = ImageFont.load_default()
-        small_font = ImageFont.load_default()
+def add_member(data):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO members (
+            id, card_id, full_name, category, position, department,
+            organization, email, phone, emergency_contact, blood_group,
+            status, notes, created_at, photo, qr_token_hash, qr_token_enc,
+            expiry_date, issue_version, last_reissued_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            data["id"], data["card_id"], data["full_name"], data["category"],
+            data["position"], data["department"], data["organization"],
+            data["email"], data["phone"], data["emergency_contact"],
+            data["blood_group"], data["status"], data["notes"],
+            data["created_at"], data["photo"], data["qr_token_hash"],
+            data["qr_token_enc"], data["expiry_date"], data["issue_version"],
+            data["last_reissued_at"], data["updated_at"],
+        ),
+    )
+    conn.commit()
+    conn.close()
+    add_audit("CREATE_MEMBER", data["id"], data["card_id"], "New identity created")
 
-    draw.rectangle([0, 0, width, 120], fill=(25, 45, 85))
-    draw.text((45, 32), "EVENT OFFICIAL IDENTITY CARD", fill="white", font=title_font)
+def update_member(member_id, data):
+    conn = get_connection()
+    conn.execute(
+        """
+        UPDATE members SET
+            card_id=?, full_name=?, category=?, position=?, department=?,
+            organization=?, email=?, phone=?, emergency_contact=?,
+            blood_group=?, status=?, notes=?, expiry_date=?, updated_at=?
+        WHERE id=?
+        """,
+        (
+            data["card_id"], data["full_name"], data["category"],
+            data["position"], data["department"], data["organization"],
+            data["email"], data["phone"], data["emergency_contact"],
+            data["blood_group"], data["status"], data["notes"],
+            data["expiry_date"], datetime.now().isoformat(timespec="seconds"),
+            member_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    add_audit("UPDATE_MEMBER", member_id, data["card_id"], "Identity record updated")
 
-    draw.text((55, 165), member["full_name"], fill=(15, 15, 15), font=name_font)
-    draw.text((55, 235), member["position"], fill=(35, 55, 95), font=normal_font)
+def update_photo(member_id, card_id, photo_bytes):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE members SET photo=?, updated_at=? WHERE id=?",
+        (photo_bytes, datetime.now().isoformat(timespec="seconds"), member_id),
+    )
+    conn.commit()
+    conn.close()
+    add_audit("UPDATE_PHOTO", member_id, card_id, "Photo changed")
 
-    draw.text((55, 300), f"Category: {member['category']}", fill=(30, 30, 30), font=small_font)
-    draw.text((55, 345), f"Department: {member.get('department') or '-'}", fill=(30, 30, 30), font=small_font)
-    draw.text((55, 390), f"Organization: {member.get('organization') or '-'}", fill=(30, 30, 30), font=small_font)
-    draw.text((55, 435), f"Card ID: {member['card_id']}", fill=(30, 30, 30), font=small_font)
-    draw.text((55, 480), f"Status: {member['status']}", fill=(30, 30, 30), font=small_font)
+def delete_member(member_id, card_id):
+    conn = get_connection()
+    conn.execute("DELETE FROM members WHERE id=?", (member_id,))
+    conn.commit()
+    conn.close()
+    add_audit("DELETE_MEMBER", member_id, card_id, "Identity deleted")
 
-    qr_img, _ = make_qr_image(member["id"])
-    qr_img = qr_img.resize((300, 300))
-    card.paste(qr_img, (700, 180))
+def get_all_members():
+    conn = get_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT id, card_id, full_name, category, position, department,
+               organization, email, phone, emergency_contact, blood_group,
+               status, notes, created_at, expiry_date, issue_version,
+               last_reissued_at, updated_at
+        FROM members
+        ORDER BY full_name
+        """,
+        conn,
+    )
+    conn.close()
+    return df
 
-    draw.text((720, 500), "Scan to verify identity", fill=(30, 30, 30), font=small_font)
-    draw.text((55, 585), "Generated by Event Identity & QR Management System", fill=(80, 80, 80), font=small_font)
+def get_member_by_id(member_id):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM members WHERE id=?", (member_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
-    return card
+def get_member_by_token(token):
+    token_digest = hash_token(token)
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM members WHERE qr_token_hash=?",
+        (token_digest,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
-def generate_card_id(category):
-    prefix = "EC" if category == "Executive Council" else "ORG"
-    random_part = uuid.uuid4().hex[:6].upper()
-    return f"{prefix}-{random_part}"
+def reissue_qr(member_id, card_id):
+    token = new_qr_token()
+    digest = hash_token(token)
+    encrypted = encrypt_token(token)
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COALESCE(issue_version, 1) AS issue_version FROM members WHERE id=?",
+        (member_id,),
+    ).fetchone()
+    next_version = int(row["issue_version"] or 1) + 1 if row else 2
 
+    conn.execute(
+        """
+        UPDATE members
+        SET qr_token_hash=?, qr_token_enc=?, issue_version=?,
+            last_reissued_at=?, updated_at=?
+        WHERE id=?
+        """,
+        (
+            digest, encrypted, next_version,
+            datetime.now().isoformat(timespec="seconds"),
+            datetime.now().isoformat(timespec="seconds"),
+            member_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    add_audit("REISSUE_QR", member_id, card_id, f"QR token rotated to version {next_version}")
+    return token
+
+def set_status(member_id, card_id, status):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE members SET status=?, updated_at=? WHERE id=?",
+        (status, datetime.now().isoformat(timespec="seconds"), member_id),
+    )
+    conn.commit()
+    conn.close()
+    add_audit("STATUS_CHANGE", member_id, card_id, f"Status changed to {status}")
+
+def log_scan(member, verification_id, result):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO scan_logs(member_id, card_id, scan_time, verification_id, result)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            member["id"] if member else None,
+            member["card_id"] if member else None,
+            datetime.now().isoformat(timespec="seconds"),
+            verification_id,
+            result,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+def get_scan_count(member_id):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM scan_logs WHERE member_id=?",
+        (member_id,),
+    ).fetchone()
+    conn.close()
+    return int(row["c"]) if row else 0
+
+def get_recent_scans(limit=100):
+    conn = get_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT scan_time, card_id, verification_id, result
+        FROM scan_logs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,),
+    )
+    conn.close()
+    return df
+
+def get_audit_log(limit=100):
+    conn = get_connection()
+    df = pd.read_sql_query(
+        """
+        SELECT action_time, action, card_id, details
+        FROM admin_audit
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        conn,
+        params=(limit,),
+    )
+    conn.close()
+    return df
+
+# ============================================================
+# VISUAL / CARD HELPERS
+# ============================================================
 def safe_text(value):
     if value is None:
         return "-"
     value = str(value).strip()
     return value if value else "-"
 
-# -----------------------------
-# STYLING
-# -----------------------------
+def generate_card_id(category):
+    if category == "Executive Council":
+        prefix = "EC"
+    elif category == "Organizer":
+        prefix = "ORG"
+    elif category == "Volunteer":
+        prefix = "VOL"
+    else:
+        prefix = "ID"
+    return f"AX-{prefix}-{secrets.token_hex(3).upper()}"
+
+def photo_image(photo_bytes):
+    if not photo_bytes:
+        return None
+    try:
+        return Image.open(io.BytesIO(photo_bytes)).convert("RGB")
+    except Exception:
+        return None
+
+def official_host():
+    if not APP_BASE_URL:
+        return "localhost / development"
+    try:
+        return urlparse(APP_BASE_URL).netloc or APP_BASE_URL
+    except Exception:
+        return APP_BASE_URL
+
+def live_security_code(member_id):
+    """
+    Rotating code changes every 30 seconds.
+    Useful against screenshots / stale verification pages.
+    """
+    window = int(datetime.now().timestamp() // 30)
+    msg = f"{member_id}:{window}".encode("utf-8")
+    digest = hmac.new(LIVE_SECRET, msg, hashlib.sha256).hexdigest()
+    number = int(digest[:12], 16) % 1000000
+    return f"{number:06d}"
+
+def make_id_card(member, token):
+    width, height = 1050, 650
+    card = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(card)
+
+    try:
+        title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 46)
+        name_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 40)
+        normal_font = ImageFont.truetype("DejaVuSans.ttf", 28)
+        small_font = ImageFont.truetype("DejaVuSans.ttf", 22)
+    except Exception:
+        title_font = name_font = normal_font = small_font = ImageFont.load_default()
+
+    draw.rectangle([0, 0, width, 110], fill=(18, 43, 84))
+    draw.text((40, 30), "AIRNEXUS OFFICIAL IDENTITY CARD", fill="white", font=title_font)
+
+    pimg = photo_image(member.get("photo"))
+    if pimg:
+        pimg.thumbnail((230, 260))
+        px = 55 + (230 - pimg.width) // 2
+        py = 160 + (260 - pimg.height) // 2
+        card.paste(pimg, (px, py))
+        draw.rectangle([55, 160, 285, 420], outline=(20, 20, 20), width=2)
+    else:
+        draw.rectangle([55, 160, 285, 420], outline=(60, 60, 60), width=2)
+        draw.text((95, 275), "PHOTO", fill=(100, 100, 100), font=normal_font)
+
+    draw.text((330, 165), member["full_name"], fill=(10, 10, 10), font=name_font)
+    draw.text((330, 225), member["position"], fill=(25, 55, 100), font=normal_font)
+    draw.text((330, 285), f"Category: {member['category']}", fill=(30, 30, 30), font=small_font)
+    draw.text((330, 325), f"Committee: {member.get('department') or '-'}", fill=(30, 30, 30), font=small_font)
+    draw.text((330, 365), f"Card ID: {member['card_id']}", fill=(30, 30, 30), font=small_font)
+    draw.text((330, 405), f"Status: {member['status']}", fill=(30, 30, 30), font=small_font)
+
+    qr_img, _ = make_qr_from_token(token)
+    qr_img = qr_img.resize((230, 230))
+    card.paste(qr_img, (785, 165))
+
+    draw.text((770, 410), "SCAN FOR LIVE", fill=(20, 20, 20), font=small_font)
+    draw.text((790, 445), "VERIFICATION", fill=(20, 20, 20), font=small_font)
+
+    draw.rectangle([0, 540, width, 650], fill=(245, 247, 250))
+    draw.text((40, 565), f"Official verification: {official_host()}", fill=(60, 60, 60), font=small_font)
+    draw.text((40, 605), f"Issue Version: {member.get('issue_version') or 1}", fill=(60, 60, 60), font=small_font)
+
+    return card
+
+# ============================================================
+# CSS
+# ============================================================
 st.markdown(
     """
     <style>
-    .main-title {
-        font-size: 2.2rem;
+    .title {
+        font-size: 2.25rem;
         font-weight: 800;
-        margin-bottom: 0.2rem;
+        margin-bottom: 0.15rem;
     }
     .subtitle {
         color: #666;
-        margin-bottom: 1.3rem;
+        margin-bottom: 1rem;
     }
-    .profile-box {
-        padding: 1.4rem;
-        border: 1px solid #dedede;
-        border-radius: 14px;
-        background: #ffffff;
+    .verified-card {
+        border: 2px solid #1f8f4e;
+        background: #effbf3;
+        border-radius: 18px;
+        padding: 20px;
     }
-    .verified {
-        display:inline-block;
-        padding:7px 12px;
-        background:#e8f7ed;
-        border-radius:20px;
-        color:#19713a;
-        font-weight:700;
+    .danger-card {
+        border: 2px solid #b42318;
+        background: #fff3f2;
+        border-radius: 18px;
+        padding: 20px;
     }
-    .inactive {
-        display:inline-block;
-        padding:7px 12px;
-        background:#fff0f0;
-        border-radius:20px;
-        color:#a82121;
-        font-weight:700;
+    .live-code {
+        font-size: 2.2rem;
+        font-weight: 800;
+        letter-spacing: 0.3rem;
+        background: #111827;
+        color: white;
+        border-radius: 12px;
+        padding: 12px 18px;
+        display: inline-block;
+    }
+    .official-domain {
+        font-family: monospace;
+        background: #f0f2f6;
+        padding: 5px 8px;
+        border-radius: 7px;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# -----------------------------
-# PUBLIC PROFILE MODE
-# -----------------------------
-member_param = st.query_params.get("member")
+# ============================================================
+# PUBLIC VERIFICATION MODE
+# ============================================================
+verify_token = st.query_params.get("verify")
 
-if member_param:
-    member = get_member(member_param)
+if verify_token:
+    verification_id = f"V-{secrets.token_hex(4).upper()}"
+    member = get_member_by_token(verify_token)
 
-    st.markdown('<div class="main-title">Official Event Identity Verification</div>', unsafe_allow_html=True)
+    st.markdown('<div class="title">🛡️ AirNexus Live Identity Verification</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="subtitle">This page verifies the identity and event role associated with the scanned QR code.</div>',
+        f'<div class="subtitle">Official verification host: '
+        f'<span class="official-domain">{official_host()}</span></div>',
         unsafe_allow_html=True,
     )
 
     if not member:
-        st.error("Invalid or expired identity record. Please contact the event administration.")
+        log_scan(None, verification_id, "INVALID_TOKEN")
+        st.error("INVALID QR / IDENTITY NOT FOUND")
+        st.warning("Do not accept this card. The QR may be forged, expired, revoked, or incorrectly copied.")
+        st.write(f"Verification ID: `{verification_id}`")
         st.stop()
 
-    left, right = st.columns([2, 1])
+    # Evaluate status and expiry.
+    expiry_ok = True
+    if member.get("expiry_date"):
+        try:
+            expiry_ok = date.fromisoformat(member["expiry_date"]) >= date.today()
+        except Exception:
+            expiry_ok = True
+
+    is_active = member["status"] == "Active" and expiry_ok
+    result = "VERIFIED" if is_active else "NOT_AUTHORIZED"
+    log_scan(member, verification_id, result)
+
+    left, right = st.columns([1, 2])
 
     with left:
-        st.markdown('<div class="profile-box">', unsafe_allow_html=True)
-        st.header(member["full_name"])
-        st.subheader(member["position"])
-
-        if member["status"] == "Active":
-            st.markdown('<span class="verified">✓ ACTIVE / VERIFIED</span>', unsafe_allow_html=True)
+        pimg = photo_image(member.get("photo"))
+        if pimg:
+            st.image(pimg, caption="Official registered photograph", use_container_width=True)
         else:
-            st.markdown('<span class="inactive">INACTIVE / NOT AUTHORIZED</span>', unsafe_allow_html=True)
+            st.warning("No official photograph is registered for this identity.")
 
-        st.write("")
-        st.write(f"**Category:** {safe_text(member['category'])}")
-        st.write(f"**Department / Committee:** {safe_text(member['department'])}")
-        st.write(f"**Organization / Institution:** {safe_text(member['organization'])}")
-        st.write(f"**Card ID:** `{member['card_id']}`")
+    with right:
+        box_class = "verified-card" if is_active else "danger-card"
+        st.markdown(f'<div class="{box_class}">', unsafe_allow_html=True)
 
-        if safe_text(member.get("notes")) != "-":
-            st.write(f"**Event Note:** {safe_text(member.get('notes'))}")
+        if is_active:
+            st.markdown("## ✅ LIVE VERIFIED")
+        else:
+            st.markdown("## ⛔ NOT AUTHORIZED")
+
+        st.markdown(f"### {member['full_name']}")
+        st.markdown(f"**Position:** {safe_text(member['position'])}")
+        st.markdown(f"**Category:** {safe_text(member['category'])}")
+        st.markdown(f"**Committee / Department:** {safe_text(member['department'])}")
+        st.markdown(f"**Card ID:** `{member['card_id']}`")
+        st.markdown(f"**Status:** **{member['status']}**")
+
+        if member.get("expiry_date"):
+            st.markdown(f"**Valid Until:** {member['expiry_date']}")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    with right:
-        qr_img, _ = make_qr_image(member["id"])
-        st.image(qr_img, caption="Official verification QR", width=280)
-        st.caption("The QR code links to this verification page.")
+        st.write("")
+        st.markdown("### Live anti-screenshot code")
+        st.markdown(
+            f'<span class="live-code">{live_security_code(member["id"])}</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption("This code changes approximately every 30 seconds. Refresh the page if checking a screenshot or stale page.")
 
-    st.info("For security, private contact information is not displayed on the public verification page.")
+        st.write(f"**Verification ID:** `{verification_id}`")
+        st.write(f"**Verified at:** `{datetime.now().strftime('%d %b %Y, %I:%M:%S %p')}`")
+        st.write(f"**QR issue version:** `{member.get('issue_version') or 1}`")
+
+    st.info(
+        "Security check: compare the person with the official photo, confirm the Card ID printed on the physical card, "
+        "and make sure this page is opened on the official verification domain shown above."
+    )
+
+    if not is_active:
+        st.error(
+            "This identity is inactive, revoked, lost, or expired. Do not accept it for event access."
+        )
+
     st.stop()
 
-# -----------------------------
-# ADMIN / DASHBOARD MODE
-# -----------------------------
-st.markdown('<div class="main-title">Event Identity & QR Management</div>', unsafe_allow_html=True)
+# ============================================================
+# ADMIN AUTHENTICATION
+# ============================================================
+if "admin_authenticated" not in st.session_state:
+    st.session_state.admin_authenticated = False
+
+with st.sidebar:
+    st.header("🔐 Administration")
+
+    if not st.session_state.admin_authenticated:
+        admin_pw = st.text_input("Admin Password", type="password")
+        totp_code = ""
+        if ADMIN_TOTP_SECRET:
+            totp_code = st.text_input("Authenticator Code", type="password", max_chars=6)
+
+        if st.button("Secure Login", use_container_width=True):
+            password_ok = secure_equal(admin_pw, ADMIN_PASSWORD)
+            totp_ok = True
+
+            if ADMIN_TOTP_SECRET:
+                try:
+                    totp_ok = pyotp.TOTP(ADMIN_TOTP_SECRET).verify(totp_code, valid_window=1)
+                except Exception:
+                    totp_ok = False
+
+            if password_ok and totp_ok:
+                st.session_state.admin_authenticated = True
+                st.rerun()
+            else:
+                st.error("Invalid administrator credentials.")
+    else:
+        st.success("Administrator authenticated")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.admin_authenticated = False
+            st.rerun()
+
+    st.divider()
+    st.caption("QR scans never require administrator access.")
+
+if not st.session_state.admin_authenticated:
+    st.markdown('<div class="title">AirNexus Secure Identity Management</div>', unsafe_allow_html=True)
+    st.info("Administrator login is required to manage identities.")
+    st.caption("Public QR verification works directly from the QR code.")
+    st.stop()
+
+# ============================================================
+# ADMIN DASHBOARD
+# ============================================================
+st.markdown('<div class="title">AirNexus Secure Identity Management</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">Manage organizers and executive council members, issue QR identities, and verify event roles.</div>',
+    '<div class="subtitle">Issue, verify, revoke and audit official event identities.</div>',
     unsafe_allow_html=True,
 )
 
-with st.sidebar:
-    st.header("Administration")
-    password = st.text_input("Admin Password", type="password")
-    logged_in = password == ADMIN_PASSWORD
-
-    if logged_in:
-        st.success("Administrator access granted")
-    elif password:
-        st.error("Incorrect password")
-
-    st.divider()
-    st.caption("Public QR scans do not require the admin password.")
-
-if not logged_in:
-    st.info("Enter the administrator password in the sidebar to manage records.")
-    st.warning(
-        "Before public deployment, set ADMIN_PASSWORD and APP_BASE_URL in Streamlit Secrets. "
-        "Do not keep the default password."
-    )
-    st.stop()
-
 members_df = get_all_members()
 
-# -----------------------------
-# METRICS
-# -----------------------------
-c1, c2, c3, c4 = st.columns(4)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Total Identities", len(members_df))
+m2.metric("Active", int((members_df["status"] == "Active").sum()) if not members_df.empty else 0)
+m3.metric("Revoked / Lost", int(members_df["status"].isin(["Revoked", "Lost"]).sum()) if not members_df.empty else 0)
+m4.metric("Total Scans", len(get_recent_scans(100000)))
 
-total_members = len(members_df)
-active_members = int((members_df["status"] == "Active").sum()) if not members_df.empty else 0
-executives = int((members_df["category"] == "Executive Council").sum()) if not members_df.empty else 0
-organizers = int((members_df["category"] == "Organizer").sum()) if not members_df.empty else 0
+if ADMIN_PASSWORD == "admin123":
+    st.error("SECURITY WARNING: Change the default ADMIN_PASSWORD in Streamlit Secrets before real event use.")
 
-c1.metric("Total Records", total_members)
-c2.metric("Active Identities", active_members)
-c3.metric("Executive Council", executives)
-c4.metric("Organizers", organizers)
+if not APP_BASE_URL:
+    st.warning("APP_BASE_URL is not configured. Generated QR codes currently point to localhost.")
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["➕ Add Record", "📋 Manage Records", "🔳 QR / ID Cards", "📤 Import / Export"]
-)
+if not APP_ENCRYPTION_KEY:
+    st.warning(
+        "APP_ENCRYPTION_KEY is not configured. The app is using a password-derived fallback key. "
+        "For production, set a dedicated Fernet key in Streamlit Secrets."
+    )
 
-# -----------------------------
-# ADD RECORD
-# -----------------------------
-with tab1:
-    st.subheader("Add New Person")
+tabs = st.tabs([
+    "➕ Issue Identity",
+    "📋 Manage",
+    "🔳 QR / Card",
+    "🛡️ Scan Logs",
+    "📤 Import / Export",
+    "📜 Admin Audit",
+])
 
-    with st.form("add_member_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
+# ============================================================
+# TAB 1 - ISSUE IDENTITY
+# ============================================================
+with tabs[0]:
+    st.subheader("Issue New Secure Identity")
 
-        with col1:
+    with st.form("new_member_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+
+        with c1:
             full_name = st.text_input("Full Name *")
             category = st.selectbox(
                 "Category *",
                 ["Organizer", "Executive Council", "Volunteer", "Guest / Other"],
             )
-            position = st.text_input(
-                "Position / Designation *",
-                placeholder="e.g. President, General Secretary, Event Organizer",
-            )
-            department = st.text_input(
-                "Department / Committee",
-                placeholder="e.g. Registration Committee",
-            )
-            organization = st.text_input(
-                "Organization / Institution",
-                placeholder="e.g. Air University",
-            )
-            status = st.selectbox("Identity Status", ["Active", "Inactive"])
+            position = st.text_input("Position / Designation *")
+            department = st.text_input("Committee / Department")
+            organization = st.text_input("Organization", value="Air University")
+            expiry_date = st.date_input("Valid Until", value=date.today(), format="YYYY-MM-DD")
 
-        with col2:
+        with c2:
             email = st.text_input("Email")
             phone = st.text_input("Phone")
             emergency_contact = st.text_input("Emergency Contact")
@@ -426,28 +757,28 @@ with tab1:
                 "Blood Group",
                 ["", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"],
             )
-            manual_card_id = st.text_input(
-                "Custom Card ID (optional)",
-                placeholder="Leave blank to auto-generate",
+            manual_card_id = st.text_input("Custom Card ID (optional)")
+            photo_file = st.file_uploader(
+                "Official Photo *",
+                type=["jpg", "jpeg", "png"],
+                help="This photo appears on the live verification screen.",
             )
-            notes = st.text_area(
-                "Public Event Note (optional)",
-                placeholder="Only write information here that may safely appear on the QR verification page.",
-            )
+            notes = st.text_area("Public Event Note (optional)")
 
-        submitted = st.form_submit_button(
-            "Create Record & QR",
-            use_container_width=True
-        )
+        submitted = st.form_submit_button("Issue Secure Identity", use_container_width=True)
 
-    # IMPORTANT:
-    # The download button is outside the form.
+    # Keep normal/download buttons outside the form.
     if submitted:
         if not full_name.strip() or not position.strip():
-            st.error("Full Name and Position / Designation are required.")
+            st.error("Full Name and Position are required.")
+        elif photo_file is None:
+            st.error("An official photograph is required for secure identity verification.")
         else:
             member_id = str(uuid.uuid4())
             card_id = manual_card_id.strip() or generate_card_id(category)
+            token = new_qr_token()
+            now = datetime.now().isoformat(timespec="seconds")
+            photo_bytes = photo_file.getvalue()
 
             data = {
                 "id": member_id,
@@ -461,312 +792,391 @@ with tab1:
                 "phone": phone.strip(),
                 "emergency_contact": emergency_contact.strip(),
                 "blood_group": blood_group,
-                "status": status,
+                "status": "Active",
                 "notes": notes.strip(),
-                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "created_at": now,
+                "photo": photo_bytes,
+                "qr_token_hash": hash_token(token),
+                "qr_token_enc": encrypt_token(token),
+                "expiry_date": expiry_date.isoformat(),
+                "issue_version": 1,
+                "last_reissued_at": now,
+                "updated_at": now,
             }
 
             try:
                 add_member(data)
+                st.success(f"Secure identity issued. Card ID: {card_id}")
 
-                st.success(f"Record created successfully. Card ID: {card_id}")
+                qr_img, verify_url = make_qr_from_token(token)
+                card_img = make_id_card(data, token)
 
-                qr_img, profile_url = make_qr_image(member_id)
+                q1, q2 = st.columns([1, 2])
 
-                st.markdown("### Generated QR Code")
-                st.image(qr_img, width=260)
+                with q1:
+                    st.image(qr_img, width=280)
+                    st.code(verify_url)
+                    st.download_button(
+                        "Download Secure QR",
+                        data=png_bytes(qr_img),
+                        file_name=f"{card_id}_QR.png",
+                        mime="image/png",
+                        key=f"new_qr_{member_id}",
+                        use_container_width=True,
+                    )
 
-                st.markdown("### Verification URL")
-                st.code(profile_url)
-
-                qr_bytes = image_to_png_bytes(qr_img)
-
-                st.download_button(
-                    label="⬇️ Download QR Code",
-                    data=qr_bytes,
-                    file_name=f"{card_id}_QR.png",
-                    mime="image/png",
-                    key=f"download_qr_{member_id}",
-                    use_container_width=True,
-                )
+                with q2:
+                    st.image(card_img, use_container_width=True)
+                    st.download_button(
+                        "Download ID Card",
+                        data=png_bytes(card_img),
+                        file_name=f"{card_id}_ID_Card.png",
+                        mime="image/png",
+                        key=f"new_card_{member_id}",
+                        use_container_width=True,
+                    )
 
             except sqlite3.IntegrityError:
-                st.error("That Card ID already exists. Please use another Card ID.")
+                st.error("That Card ID already exists. Choose another Card ID.")
 
-# -----------------------------
-# MANAGE RECORDS
-# -----------------------------
-with tab2:
-    st.subheader("Search, Edit or Delete Records")
+# ============================================================
+# TAB 2 - MANAGE
+# ============================================================
+with tabs[1]:
+    st.subheader("Search, Edit, Revoke, Reissue or Delete")
 
     if members_df.empty:
-        st.info("No records have been created yet.")
+        st.info("No identities found.")
     else:
-        search = st.text_input(
-            "Search",
-            placeholder="Search by name, card ID, position, category or department",
-        ).strip().lower()
-
+        search = st.text_input("Search by name, card ID, role, committee or category").strip().lower()
         filtered = members_df.copy()
 
         if search:
-            mask = (
-                filtered["full_name"].fillna("").str.lower().str.contains(search, regex=False)
-                | filtered["card_id"].fillna("").str.lower().str.contains(search, regex=False)
-                | filtered["position"].fillna("").str.lower().str.contains(search, regex=False)
-                | filtered["category"].fillna("").str.lower().str.contains(search, regex=False)
-                | filtered["department"].fillna("").str.lower().str.contains(search, regex=False)
-            )
+            mask = False
+            for col in ["full_name", "card_id", "position", "department", "category"]:
+                mask = mask | filtered[col].fillna("").str.lower().str.contains(search, regex=False)
             filtered = filtered[mask]
 
-        display_cols = [
-            "card_id",
-            "full_name",
-            "category",
-            "position",
-            "department",
-            "status",
-            "created_at",
-        ]
-
         st.dataframe(
-            filtered[display_cols],
+            filtered[
+                ["card_id", "full_name", "category", "position", "department", "status", "expiry_date", "issue_version"]
+            ],
             use_container_width=True,
             hide_index=True,
         )
 
         if not filtered.empty:
             selected_label = st.selectbox(
-                "Select Record",
-                [
-                    f"{row.full_name} — {row.position} — {row.card_id}"
-                    for row in filtered.itertuples()
-                ],
+                "Select Identity",
+                [f"{r.full_name} — {r.position} — {r.card_id}" for r in filtered.itertuples()],
                 index=None,
-                placeholder="Choose a record to edit or delete",
+                placeholder="Choose a record",
             )
 
             if selected_label:
                 selected_card_id = selected_label.rsplit(" — ", 1)[-1]
-                selected_row = filtered[filtered["card_id"] == selected_card_id].iloc[0].to_dict()
+                selected_id = filtered.loc[filtered["card_id"] == selected_card_id, "id"].iloc[0]
+                member = get_member_by_id(selected_id)
+
+                pcol, dcol = st.columns([1, 2])
+
+                with pcol:
+                    pimg = photo_image(member.get("photo"))
+                    if pimg:
+                        st.image(pimg, caption="Registered photo", use_container_width=True)
+                    else:
+                        st.warning("No photo registered.")
+
+                    replacement_photo = st.file_uploader(
+                        "Replace Photo",
+                        type=["jpg", "jpeg", "png"],
+                        key=f"photo_replace_{member['id']}",
+                    )
+                    if replacement_photo is not None:
+                        if st.button("Save New Photo", key=f"save_photo_{member['id']}"):
+                            update_photo(member["id"], member["card_id"], replacement_photo.getvalue())
+                            st.success("Photo updated.")
+                            st.rerun()
+
+                with dcol:
+                    with st.form(f"edit_form_{member['id']}"):
+                        ec1, ec2 = st.columns(2)
+
+                        with ec1:
+                            e_name = st.text_input("Full Name *", value=member["full_name"])
+                            categories = ["Organizer", "Executive Council", "Volunteer", "Guest / Other"]
+                            e_category = st.selectbox(
+                                "Category",
+                                categories,
+                                index=categories.index(member["category"]) if member["category"] in categories else 0,
+                            )
+                            e_position = st.text_input("Position", value=member["position"])
+                            e_department = st.text_input("Committee / Department", value=member.get("department") or "")
+                            e_org = st.text_input("Organization", value=member.get("organization") or "")
+                            e_card = st.text_input("Card ID", value=member["card_id"])
+
+                        with ec2:
+                            e_email = st.text_input("Email", value=member.get("email") or "")
+                            e_phone = st.text_input("Phone", value=member.get("phone") or "")
+                            e_emergency = st.text_input("Emergency Contact", value=member.get("emergency_contact") or "")
+                            e_bg = st.text_input("Blood Group", value=member.get("blood_group") or "")
+                            statuses = ["Active", "Inactive", "Revoked", "Lost"]
+                            e_status = st.selectbox(
+                                "Status",
+                                statuses,
+                                index=statuses.index(member["status"]) if member["status"] in statuses else 0,
+                            )
+                            try:
+                                exp_default = date.fromisoformat(member["expiry_date"]) if member.get("expiry_date") else date.today()
+                            except Exception:
+                                exp_default = date.today()
+                            e_expiry = st.date_input("Valid Until", value=exp_default, format="YYYY-MM-DD")
+                            e_notes = st.text_area("Public Event Note", value=member.get("notes") or "")
+
+                        save_edit = st.form_submit_button("Save Changes", use_container_width=True)
+
+                    if save_edit:
+                        if not e_name.strip() or not e_position.strip():
+                            st.error("Name and Position are required.")
+                        else:
+                            try:
+                                update_member(
+                                    member["id"],
+                                    {
+                                        "card_id": e_card.strip(),
+                                        "full_name": e_name.strip(),
+                                        "category": e_category,
+                                        "position": e_position.strip(),
+                                        "department": e_department.strip(),
+                                        "organization": e_org.strip(),
+                                        "email": e_email.strip(),
+                                        "phone": e_phone.strip(),
+                                        "emergency_contact": e_emergency.strip(),
+                                        "blood_group": e_bg.strip(),
+                                        "status": e_status,
+                                        "notes": e_notes.strip(),
+                                        "expiry_date": e_expiry.isoformat(),
+                                    },
+                                )
+                                st.success("Record updated.")
+                                st.rerun()
+                            except sqlite3.IntegrityError:
+                                st.error("That Card ID is already used by another identity.")
 
                 st.divider()
-                st.markdown(f"### Edit: {selected_row['full_name']}")
+                a1, a2, a3 = st.columns(3)
 
-                with st.form("edit_member_form"):
-                    e1, e2 = st.columns(2)
+                with a1:
+                    st.markdown("#### Immediate Revocation")
+                    if st.button(
+                        "Revoke Card",
+                        key=f"revoke_{member['id']}",
+                        use_container_width=True,
+                        disabled=member["status"] == "Revoked",
+                    ):
+                        set_status(member["id"], member["card_id"], "Revoked")
+                        st.success("Identity revoked. Existing QR will show NOT AUTHORIZED.")
+                        st.rerun()
 
-                    with e1:
-                        e_full_name = st.text_input("Full Name *", value=safe_text(selected_row["full_name"]))
-                        categories = ["Organizer", "Executive Council", "Volunteer", "Guest / Other"]
-                        current_category = selected_row["category"]
-                        e_category = st.selectbox(
-                            "Category *",
-                            categories,
-                            index=categories.index(current_category) if current_category in categories else 0,
+                with a2:
+                    st.markdown("#### Reissue QR")
+                    st.caption("Immediately invalidates all older printed/copied QR codes for this person.")
+                    confirm_reissue = st.checkbox(
+                        "I understand the old QR will stop working",
+                        key=f"confirm_reissue_{member['id']}",
+                    )
+                    if st.button(
+                        "Rotate / Reissue QR",
+                        key=f"reissue_{member['id']}",
+                        use_container_width=True,
+                        disabled=not confirm_reissue,
+                    ):
+                        new_token = reissue_qr(member["id"], member["card_id"])
+                        st.session_state[f"fresh_token_{member['id']}"] = new_token
+                        st.success("New QR issued. Old QR is now invalid.")
+                        st.rerun()
+
+                    fresh_token = st.session_state.get(f"fresh_token_{member['id']}")
+                    if fresh_token:
+                        qi, qu = make_qr_from_token(fresh_token)
+                        st.image(qi, width=220)
+                        st.download_button(
+                            "Download Reissued QR",
+                            data=png_bytes(qi),
+                            file_name=f"{member['card_id']}_REISSUED_QR.png",
+                            mime="image/png",
+                            key=f"reissued_download_{member['id']}",
                         )
-                        e_position = st.text_input("Position / Designation *", value=safe_text(selected_row["position"]))
-                        e_department = st.text_input("Department / Committee", value="" if safe_text(selected_row["department"]) == "-" else safe_text(selected_row["department"]))
-                        e_organization = st.text_input("Organization / Institution", value="" if safe_text(selected_row["organization"]) == "-" else safe_text(selected_row["organization"]))
-                        statuses = ["Active", "Inactive"]
-                        e_status = st.selectbox(
-                            "Identity Status",
-                            statuses,
-                            index=statuses.index(selected_row["status"]) if selected_row["status"] in statuses else 0,
-                        )
 
-                    with e2:
-                        e_email = st.text_input("Email", value="" if safe_text(selected_row["email"]) == "-" else safe_text(selected_row["email"]))
-                        e_phone = st.text_input("Phone", value="" if safe_text(selected_row["phone"]) == "-" else safe_text(selected_row["phone"]))
-                        e_emergency = st.text_input("Emergency Contact", value="" if safe_text(selected_row["emergency_contact"]) == "-" else safe_text(selected_row["emergency_contact"]))
-                        blood_groups = ["", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
-                        current_bg = selected_row["blood_group"] if selected_row["blood_group"] in blood_groups else ""
-                        e_blood = st.selectbox("Blood Group", blood_groups, index=blood_groups.index(current_bg))
-                        e_card_id = st.text_input("Card ID", value=safe_text(selected_row["card_id"]))
-                        e_notes = st.text_area("Public Event Note", value="" if safe_text(selected_row["notes"]) == "-" else safe_text(selected_row["notes"]))
+                with a3:
+                    st.markdown("#### Permanent Delete")
+                    confirm_delete = st.checkbox(
+                        "Permanently delete this identity",
+                        key=f"confirm_delete_{member['id']}",
+                    )
+                    if st.button(
+                        "Delete Record",
+                        key=f"delete_{member['id']}",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not confirm_delete,
+                    ):
+                        delete_member(member["id"], member["card_id"])
+                        st.success("Record deleted.")
+                        st.rerun()
 
-                    save_edit = st.form_submit_button("Save Changes", use_container_width=True)
+# ============================================================
+# TAB 3 - QR / CARD
+# ============================================================
+with tabs[2]:
+    st.subheader("Secure QR and Physical Card Output")
 
-                if save_edit:
-                    if not e_full_name.strip() or not e_position.strip():
-                        st.error("Full Name and Position / Designation are required.")
-                    else:
-                        update_data = {
-                            "card_id": e_card_id.strip(),
-                            "full_name": e_full_name.strip(),
-                            "category": e_category,
-                            "position": e_position.strip(),
-                            "department": e_department.strip(),
-                            "organization": e_organization.strip(),
-                            "email": e_email.strip(),
-                            "phone": e_phone.strip(),
-                            "emergency_contact": e_emergency.strip(),
-                            "blood_group": e_blood,
-                            "status": e_status,
-                            "notes": e_notes.strip(),
-                        }
+    current = get_all_members()
 
-                        try:
-                            update_member(selected_row["id"], update_data)
-                            st.success("Record updated successfully.")
-                            st.rerun()
-                        except sqlite3.IntegrityError:
-                            st.error("That Card ID is already being used by another record.")
+    if current.empty:
+        st.info("No identities available.")
+    else:
+        label = st.selectbox(
+            "Choose Person",
+            [f"{r.full_name} — {r.position} — {r.card_id}" for r in current.itertuples()],
+            key="card_selector",
+        )
+        cid = label.rsplit(" — ", 1)[-1]
+        member_id = current.loc[current["card_id"] == cid, "id"].iloc[0]
+        member = get_member_by_id(member_id)
 
-                st.markdown("#### Delete Record")
-                st.warning("Deleting the record will make its existing QR code invalid.")
-                confirm_delete = st.checkbox(
-                    f"I confirm that I want to delete {selected_row['full_name']}",
-                    key=f"delete_{selected_row['id']}",
+        token = decrypt_token(member.get("qr_token_enc"))
+
+        if not token:
+            st.error(
+                "This record does not have a recoverable secure QR token. "
+                "Use 'Rotate / Reissue QR' in Manage to generate a fresh token."
+            )
+        else:
+            qr_img, verify_url = make_qr_from_token(token)
+            card_img = make_id_card(member, token)
+
+            c1, c2 = st.columns([1, 2])
+
+            with c1:
+                st.image(qr_img, width=280)
+                st.code(verify_url)
+                st.download_button(
+                    "Download Secure QR",
+                    data=png_bytes(qr_img),
+                    file_name=f"{member['card_id']}_QR.png",
+                    mime="image/png",
+                    key=f"existing_qr_{member['id']}",
+                    use_container_width=True,
                 )
 
-                if st.button(
-                    "Delete Record",
-                    type="primary",
-                    disabled=not confirm_delete,
-                    key=f"delete_button_{selected_row['id']}"
-                ):
-                    delete_member(selected_row["id"])
-                    st.success("Record deleted.")
-                    st.rerun()
+            with c2:
+                st.image(card_img, use_container_width=True)
+                st.download_button(
+                    "Download ID Card",
+                    data=png_bytes(card_img),
+                    file_name=f"{member['card_id']}_ID_Card.png",
+                    mime="image/png",
+                    key=f"existing_card_{member['id']}",
+                    use_container_width=True,
+                )
 
-# -----------------------------
-# QR / ID CARDS
-# -----------------------------
-with tab3:
-    st.subheader("Generate QR Codes and Printable Identity Cards")
-
-    current_members = get_all_members()
-
-    if current_members.empty:
-        st.info("Add at least one record first.")
-    else:
-        selected_label = st.selectbox(
-            "Choose Person",
-            [
-                f"{row.full_name} — {row.position} — {row.card_id}"
-                for row in current_members.itertuples()
-            ],
-            key="qr_person",
-        )
-
-        selected_card_id = selected_label.rsplit(" — ", 1)[-1]
-        member = current_members[current_members["card_id"] == selected_card_id].iloc[0].to_dict()
-
-        qr_img, profile_url = make_qr_image(member["id"])
-        card_img = make_id_card(member)
-
-        qcol, ccol = st.columns([1, 2])
-
-        with qcol:
-            st.markdown("#### QR Code")
-            st.image(qr_img, width=280)
-            st.code(profile_url)
-            st.download_button(
-                "Download QR PNG",
-                data=image_to_png_bytes(qr_img),
-                file_name=f"{member['card_id']}_QR.png",
-                mime="image/png",
-                use_container_width=True,
-                key=f"qr_download_{member['id']}"
+            st.warning(
+                "Printed QR codes can still be photographed. Security comes from live server verification, "
+                "registered photo comparison, official-domain checking, revocation, and QR rotation."
             )
 
-        with ccol:
-            st.markdown("#### Identity Card Preview")
-            st.image(card_img, use_container_width=True)
-            st.download_button(
-                "Download ID Card PNG",
-                data=image_to_png_bytes(card_img),
-                file_name=f"{member['card_id']}_ID_Card.png",
-                mime="image/png",
-                use_container_width=True,
-                key=f"card_download_{member['id']}"
-            )
+# ============================================================
+# TAB 4 - SCAN LOGS
+# ============================================================
+with tabs[3]:
+    st.subheader("Live Verification Scan Log")
+    scans = get_recent_scans(500)
+    st.dataframe(scans, use_container_width=True, hide_index=True)
+    st.caption(
+        "Repeated or geographically impossible scans are indicators of possible credential copying. "
+        "This version records scans and verification IDs; location-based anomaly detection can be added later."
+    )
 
-        st.caption(
-            "For physical cards, you may either print the generated card or download the QR PNG "
-            "and place it inside your official card design."
-        )
-
-# -----------------------------
-# IMPORT / EXPORT
-# -----------------------------
-with tab4:
-    st.subheader("Data Backup, Export and Bulk Import")
+# ============================================================
+# TAB 5 - IMPORT / EXPORT
+# ============================================================
+with tabs[4]:
+    st.subheader("Backup / Export")
 
     export_df = get_all_members()
-
     if not export_df.empty:
-        csv_bytes = export_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download Complete Records CSV",
-            data=csv_bytes,
-            file_name="event_identity_records.csv",
+            "Download Records CSV",
+            data=export_df.to_csv(index=False).encode("utf-8"),
+            file_name="airnexus_identity_records.csv",
             mime="text/csv",
-            key="export_csv"
+            key="records_export",
         )
     else:
-        st.info("No records available to export.")
+        st.info("No records to export.")
 
     st.divider()
-    st.markdown("### Bulk Import CSV")
-    st.write(
-        "CSV columns supported: full_name, category, position, department, organization, "
-        "email, phone, emergency_contact, blood_group, status, notes, card_id."
+    st.markdown("### Bulk Import")
+    st.caption(
+        "For security, imported users are issued a fresh cryptographic QR token automatically. "
+        "Photos are not imported from CSV; add them afterward from Manage."
     )
 
     template = pd.DataFrame(
-        [
-            {
-                "full_name": "Example Name",
-                "category": "Organizer",
-                "position": "Registration Coordinator",
-                "department": "Registration Committee",
-                "organization": "Air University",
-                "email": "example@email.com",
-                "phone": "",
-                "emergency_contact": "",
-                "blood_group": "",
-                "status": "Active",
-                "notes": "",
-                "card_id": "",
-            }
-        ]
+        [{
+            "full_name": "Example Name",
+            "category": "Organizer",
+            "position": "Registration Coordinator",
+            "department": "Registration Committee",
+            "organization": "Air University",
+            "email": "example@email.com",
+            "phone": "",
+            "emergency_contact": "",
+            "blood_group": "",
+            "status": "Active",
+            "notes": "",
+            "card_id": "",
+            "expiry_date": date.today().isoformat(),
+        }]
     )
 
     st.download_button(
-        "Download CSV Import Template",
+        "Download CSV Template",
         data=template.to_csv(index=False).encode("utf-8"),
-        file_name="event_identity_import_template.csv",
+        file_name="airnexus_identity_import_template.csv",
         mime="text/csv",
-        key="template_download"
+        key="import_template",
     )
 
-    uploaded = st.file_uploader("Upload Completed CSV", type=["csv"])
+    upload = st.file_uploader("Upload CSV", type=["csv"], key="csv_import")
 
-    if uploaded is not None:
+    if upload is not None:
         try:
-            import_df = pd.read_csv(uploaded).fillna("")
-            required_cols = {"full_name", "category", "position"}
+            df = pd.read_csv(upload).fillna("")
+            required = {"full_name", "category", "position"}
 
-            if not required_cols.issubset(import_df.columns):
-                st.error("CSV must contain at least: full_name, category, position.")
+            if not required.issubset(df.columns):
+                st.error("CSV must include full_name, category and position.")
             else:
-                st.dataframe(import_df.head(20), use_container_width=True, hide_index=True)
+                st.dataframe(df.head(25), use_container_width=True, hide_index=True)
 
-                if st.button("Import Records", key="import_records_button"):
-                    inserted = 0
+                if st.button("Import Identities", key="import_btn"):
+                    added = 0
                     skipped = 0
 
-                    for _, row in import_df.iterrows():
+                    for _, row in df.iterrows():
                         full_name = str(row.get("full_name", "")).strip()
-                        category = str(row.get("category", "Organizer")).strip() or "Organizer"
                         position = str(row.get("position", "")).strip()
+                        category = str(row.get("category", "Organizer")).strip() or "Organizer"
 
                         if not full_name or not position:
                             skipped += 1
                             continue
 
+                        token = new_qr_token()
+                        now = datetime.now().isoformat(timespec="seconds")
+                        exp = str(row.get("expiry_date", "")).strip() or date.today().isoformat()
                         card_id = str(row.get("card_id", "")).strip() or generate_card_id(category)
 
                         data = {
@@ -783,24 +1193,42 @@ with tab4:
                             "blood_group": str(row.get("blood_group", "")).strip(),
                             "status": str(row.get("status", "Active")).strip() or "Active",
                             "notes": str(row.get("notes", "")).strip(),
-                            "created_at": datetime.now().isoformat(timespec="seconds"),
+                            "created_at": now,
+                            "photo": None,
+                            "qr_token_hash": hash_token(token),
+                            "qr_token_enc": encrypt_token(token),
+                            "expiry_date": exp,
+                            "issue_version": 1,
+                            "last_reissued_at": now,
+                            "updated_at": now,
                         }
 
                         try:
                             add_member(data)
-                            inserted += 1
+                            added += 1
                         except sqlite3.IntegrityError:
                             skipped += 1
 
-                    st.success(f"Import complete. Added: {inserted}. Skipped: {skipped}.")
+                    st.success(f"Import complete. Added: {added}. Skipped: {skipped}.")
                     st.rerun()
 
-        except Exception as e:
-            st.error(f"Could not read the CSV file: {e}")
+        except Exception as exc:
+            st.error(f"Could not read CSV: {exc}")
 
+# ============================================================
+# TAB 6 - ADMIN AUDIT
+# ============================================================
+with tabs[5]:
+    st.subheader("Administrator Audit Trail")
+    audit = get_audit_log(500)
+    st.dataframe(audit, use_container_width=True, hide_index=True)
+
+# ============================================================
+# FOOTER
+# ============================================================
 st.divider()
 st.caption(
-    "Important: Streamlit Community Cloud does not guarantee permanent local-file persistence. "
-    "For a live event system, use this version for development/testing or connect the database "
-    "to a persistent service such as Supabase/PostgreSQL before relying on it as the sole source of records."
+    "Production note: Streamlit Community Cloud local SQLite storage is not guaranteed to be permanent. "
+    "For the live event, move the database and photo storage to a persistent service such as Supabase/PostgreSQL. "
+    "The security controls in this version still improve QR forgery resistance, revocation, auditability, and live verification."
 )
