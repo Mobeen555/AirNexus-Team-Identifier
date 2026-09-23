@@ -178,8 +178,6 @@ init_db()
 def build_profile_url(member_id):
     if APP_BASE_URL:
         return f"{APP_BASE_URL}/?member={member_id}"
-
-    # Local fallback so QR generation still works during development.
     return f"http://localhost:8501/?member={member_id}"
 
 def make_qr_image(member_id):
@@ -202,16 +200,10 @@ def image_to_png_bytes(img):
     return buffer.getvalue()
 
 def make_id_card(member):
-    """
-    Simple printable digital card image.
-    Physical card designers can also download only the QR code and place it
-    inside Canva/Illustrator/CorelDraw/Photoshop templates.
-    """
     width, height = 1050, 650
     card = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(card)
 
-    # Fonts: Pillow default fallback works everywhere.
     try:
         title_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 52)
         name_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 45)
@@ -223,7 +215,6 @@ def make_id_card(member):
         normal_font = ImageFont.load_default()
         small_font = ImageFont.load_default()
 
-    # Header
     draw.rectangle([0, 0, width, 120], fill=(25, 45, 85))
     draw.text((45, 32), "EVENT OFFICIAL IDENTITY CARD", fill="white", font=title_font)
 
@@ -334,14 +325,13 @@ if member_param:
         st.write(f"**Organization / Institution:** {safe_text(member['organization'])}")
         st.write(f"**Card ID:** `{member['card_id']}`")
 
-        # Only deliberately selected public fields are shown.
         if safe_text(member.get("notes")) != "-":
             st.write(f"**Event Note:** {safe_text(member.get('notes'))}")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
-        qr_img, profile_url = make_qr_image(member["id"])
+        qr_img, _ = make_qr_image(member["id"])
         st.image(qr_img, caption="Official verification QR", width=280)
         st.caption("The QR code links to this verification page.")
 
@@ -445,46 +435,63 @@ with tab1:
                 placeholder="Only write information here that may safely appear on the QR verification page.",
             )
 
-        submitted = st.form_submit_button("Create Record & QR", use_container_width=True)
+        submitted = st.form_submit_button(
+            "Create Record & QR",
+            use_container_width=True
+        )
 
-        if submitted:
-            if not full_name.strip() or not position.strip():
-                st.error("Full Name and Position / Designation are required.")
-            else:
-                member_id = str(uuid.uuid4())
-                card_id = manual_card_id.strip() or generate_card_id(category)
+    # IMPORTANT:
+    # The download button is outside the form.
+    if submitted:
+        if not full_name.strip() or not position.strip():
+            st.error("Full Name and Position / Designation are required.")
+        else:
+            member_id = str(uuid.uuid4())
+            card_id = manual_card_id.strip() or generate_card_id(category)
 
-                data = {
-                    "id": member_id,
-                    "card_id": card_id,
-                    "full_name": full_name.strip(),
-                    "category": category,
-                    "position": position.strip(),
-                    "department": department.strip(),
-                    "organization": organization.strip(),
-                    "email": email.strip(),
-                    "phone": phone.strip(),
-                    "emergency_contact": emergency_contact.strip(),
-                    "blood_group": blood_group,
-                    "status": status,
-                    "notes": notes.strip(),
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                }
+            data = {
+                "id": member_id,
+                "card_id": card_id,
+                "full_name": full_name.strip(),
+                "category": category,
+                "position": position.strip(),
+                "department": department.strip(),
+                "organization": organization.strip(),
+                "email": email.strip(),
+                "phone": phone.strip(),
+                "emergency_contact": emergency_contact.strip(),
+                "blood_group": blood_group,
+                "status": status,
+                "notes": notes.strip(),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            }
 
-                try:
-                    add_member(data)
-                    st.success(f"Record created successfully. Card ID: {card_id}")
-                    qr_img, profile_url = make_qr_image(member_id)
-                    st.image(qr_img, width=260)
-                    st.code(profile_url)
-                    st.download_button(
-                        "Download QR Code",
-                        data=image_to_png_bytes(qr_img),
-                        file_name=f"{card_id}_QR.png",
-                        mime="image/png",
-                    )
-                except sqlite3.IntegrityError:
-                    st.error("That Card ID already exists. Please use another Card ID.")
+            try:
+                add_member(data)
+
+                st.success(f"Record created successfully. Card ID: {card_id}")
+
+                qr_img, profile_url = make_qr_image(member_id)
+
+                st.markdown("### Generated QR Code")
+                st.image(qr_img, width=260)
+
+                st.markdown("### Verification URL")
+                st.code(profile_url)
+
+                qr_bytes = image_to_png_bytes(qr_img)
+
+                st.download_button(
+                    label="⬇️ Download QR Code",
+                    data=qr_bytes,
+                    file_name=f"{card_id}_QR.png",
+                    mime="image/png",
+                    key=f"download_qr_{member_id}",
+                    use_container_width=True,
+                )
+
+            except sqlite3.IntegrityError:
+                st.error("That Card ID already exists. Please use another Card ID.")
 
 # -----------------------------
 # MANAGE RECORDS
@@ -521,62 +528,64 @@ with tab2:
             "status",
             "created_at",
         ]
+
         st.dataframe(
             filtered[display_cols],
             use_container_width=True,
             hide_index=True,
         )
 
-        selected_label = st.selectbox(
-            "Select Record",
-            [
-                f"{row.full_name} — {row.position} — {row.card_id}"
-                for row in filtered.itertuples()
-            ],
-            index=None,
-            placeholder="Choose a record to edit or delete",
-        )
+        if not filtered.empty:
+            selected_label = st.selectbox(
+                "Select Record",
+                [
+                    f"{row.full_name} — {row.position} — {row.card_id}"
+                    for row in filtered.itertuples()
+                ],
+                index=None,
+                placeholder="Choose a record to edit or delete",
+            )
 
-        if selected_label:
-            selected_card_id = selected_label.rsplit(" — ", 1)[-1]
-            selected_row = filtered[filtered["card_id"] == selected_card_id].iloc[0].to_dict()
+            if selected_label:
+                selected_card_id = selected_label.rsplit(" — ", 1)[-1]
+                selected_row = filtered[filtered["card_id"] == selected_card_id].iloc[0].to_dict()
 
-            st.divider()
-            st.markdown(f"### Edit: {selected_row['full_name']}")
+                st.divider()
+                st.markdown(f"### Edit: {selected_row['full_name']}")
 
-            with st.form("edit_member_form"):
-                e1, e2 = st.columns(2)
+                with st.form("edit_member_form"):
+                    e1, e2 = st.columns(2)
 
-                with e1:
-                    e_full_name = st.text_input("Full Name *", value=safe_text(selected_row["full_name"]))
-                    categories = ["Organizer", "Executive Council", "Volunteer", "Guest / Other"]
-                    current_category = selected_row["category"]
-                    e_category = st.selectbox(
-                        "Category *",
-                        categories,
-                        index=categories.index(current_category) if current_category in categories else 0,
-                    )
-                    e_position = st.text_input("Position / Designation *", value=safe_text(selected_row["position"]))
-                    e_department = st.text_input("Department / Committee", value="" if safe_text(selected_row["department"]) == "-" else safe_text(selected_row["department"]))
-                    e_organization = st.text_input("Organization / Institution", value="" if safe_text(selected_row["organization"]) == "-" else safe_text(selected_row["organization"]))
-                    statuses = ["Active", "Inactive"]
-                    e_status = st.selectbox(
-                        "Identity Status",
-                        statuses,
-                        index=statuses.index(selected_row["status"]) if selected_row["status"] in statuses else 0,
-                    )
+                    with e1:
+                        e_full_name = st.text_input("Full Name *", value=safe_text(selected_row["full_name"]))
+                        categories = ["Organizer", "Executive Council", "Volunteer", "Guest / Other"]
+                        current_category = selected_row["category"]
+                        e_category = st.selectbox(
+                            "Category *",
+                            categories,
+                            index=categories.index(current_category) if current_category in categories else 0,
+                        )
+                        e_position = st.text_input("Position / Designation *", value=safe_text(selected_row["position"]))
+                        e_department = st.text_input("Department / Committee", value="" if safe_text(selected_row["department"]) == "-" else safe_text(selected_row["department"]))
+                        e_organization = st.text_input("Organization / Institution", value="" if safe_text(selected_row["organization"]) == "-" else safe_text(selected_row["organization"]))
+                        statuses = ["Active", "Inactive"]
+                        e_status = st.selectbox(
+                            "Identity Status",
+                            statuses,
+                            index=statuses.index(selected_row["status"]) if selected_row["status"] in statuses else 0,
+                        )
 
-                with e2:
-                    e_email = st.text_input("Email", value="" if safe_text(selected_row["email"]) == "-" else safe_text(selected_row["email"]))
-                    e_phone = st.text_input("Phone", value="" if safe_text(selected_row["phone"]) == "-" else safe_text(selected_row["phone"]))
-                    e_emergency = st.text_input("Emergency Contact", value="" if safe_text(selected_row["emergency_contact"]) == "-" else safe_text(selected_row["emergency_contact"]))
-                    blood_groups = ["", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
-                    current_bg = selected_row["blood_group"] if selected_row["blood_group"] in blood_groups else ""
-                    e_blood = st.selectbox("Blood Group", blood_groups, index=blood_groups.index(current_bg))
-                    e_card_id = st.text_input("Card ID", value=safe_text(selected_row["card_id"]))
-                    e_notes = st.text_area("Public Event Note", value="" if safe_text(selected_row["notes"]) == "-" else safe_text(selected_row["notes"]))
+                    with e2:
+                        e_email = st.text_input("Email", value="" if safe_text(selected_row["email"]) == "-" else safe_text(selected_row["email"]))
+                        e_phone = st.text_input("Phone", value="" if safe_text(selected_row["phone"]) == "-" else safe_text(selected_row["phone"]))
+                        e_emergency = st.text_input("Emergency Contact", value="" if safe_text(selected_row["emergency_contact"]) == "-" else safe_text(selected_row["emergency_contact"]))
+                        blood_groups = ["", "A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+                        current_bg = selected_row["blood_group"] if selected_row["blood_group"] in blood_groups else ""
+                        e_blood = st.selectbox("Blood Group", blood_groups, index=blood_groups.index(current_bg))
+                        e_card_id = st.text_input("Card ID", value=safe_text(selected_row["card_id"]))
+                        e_notes = st.text_area("Public Event Note", value="" if safe_text(selected_row["notes"]) == "-" else safe_text(selected_row["notes"]))
 
-                save_edit = st.form_submit_button("Save Changes", use_container_width=True)
+                    save_edit = st.form_submit_button("Save Changes", use_container_width=True)
 
                 if save_edit:
                     if not e_full_name.strip() or not e_position.strip():
@@ -596,6 +605,7 @@ with tab2:
                             "status": e_status,
                             "notes": e_notes.strip(),
                         }
+
                         try:
                             update_member(selected_row["id"], update_data)
                             st.success("Record updated successfully.")
@@ -603,16 +613,22 @@ with tab2:
                         except sqlite3.IntegrityError:
                             st.error("That Card ID is already being used by another record.")
 
-            st.markdown("#### Delete Record")
-            st.warning("Deleting the record will make its existing QR code invalid.")
-            confirm_delete = st.checkbox(
-                f"I confirm that I want to delete {selected_row['full_name']}",
-                key=f"delete_{selected_row['id']}",
-            )
-            if st.button("Delete Record", type="primary", disabled=not confirm_delete):
-                delete_member(selected_row["id"])
-                st.success("Record deleted.")
-                st.rerun()
+                st.markdown("#### Delete Record")
+                st.warning("Deleting the record will make its existing QR code invalid.")
+                confirm_delete = st.checkbox(
+                    f"I confirm that I want to delete {selected_row['full_name']}",
+                    key=f"delete_{selected_row['id']}",
+                )
+
+                if st.button(
+                    "Delete Record",
+                    type="primary",
+                    disabled=not confirm_delete,
+                    key=f"delete_button_{selected_row['id']}"
+                ):
+                    delete_member(selected_row["id"])
+                    st.success("Record deleted.")
+                    st.rerun()
 
 # -----------------------------
 # QR / ID CARDS
@@ -652,6 +668,7 @@ with tab3:
                 file_name=f"{member['card_id']}_QR.png",
                 mime="image/png",
                 use_container_width=True,
+                key=f"qr_download_{member['id']}"
             )
 
         with ccol:
@@ -663,6 +680,7 @@ with tab3:
                 file_name=f"{member['card_id']}_ID_Card.png",
                 mime="image/png",
                 use_container_width=True,
+                key=f"card_download_{member['id']}"
             )
 
         st.caption(
@@ -685,6 +703,7 @@ with tab4:
             data=csv_bytes,
             file_name="event_identity_records.csv",
             mime="text/csv",
+            key="export_csv"
         )
     else:
         st.info("No records available to export.")
@@ -720,6 +739,7 @@ with tab4:
         data=template.to_csv(index=False).encode("utf-8"),
         file_name="event_identity_import_template.csv",
         mime="text/csv",
+        key="template_download"
     )
 
     uploaded = st.file_uploader("Upload Completed CSV", type=["csv"])
@@ -734,7 +754,7 @@ with tab4:
             else:
                 st.dataframe(import_df.head(20), use_container_width=True, hide_index=True)
 
-                if st.button("Import Records"):
+                if st.button("Import Records", key="import_records_button"):
                     inserted = 0
                     skipped = 0
 
@@ -778,9 +798,6 @@ with tab4:
         except Exception as e:
             st.error(f"Could not read the CSV file: {e}")
 
-# -----------------------------
-# FOOTER / DEPLOYMENT NOTICE
-# -----------------------------
 st.divider()
 st.caption(
     "Important: Streamlit Community Cloud does not guarantee permanent local-file persistence. "
