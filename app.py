@@ -2,7 +2,6 @@ import base64
 import hashlib
 import hmac
 import io
-import os
 import secrets
 import sqlite3
 import uuid
@@ -39,40 +38,56 @@ def get_secret(name, default=""):
         return default
 
 APP_BASE_URL = get_secret("APP_BASE_URL", "").strip().rstrip("/")
+
+# Administrator password: full record management
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "admin123")
+
+# Scanner password: only authorized guards/staff can open QR verification pages
+SCANNER_PASSWORD = get_secret("SCANNER_PASSWORD", "scanner123")
+
+# Optional MFA for admin login
 ADMIN_TOTP_SECRET = get_secret("ADMIN_TOTP_SECRET", "").strip()
+
+# Optional dedicated encryption key
 APP_ENCRYPTION_KEY = get_secret("APP_ENCRYPTION_KEY", "").strip()
+
+# Optional master secret for deriving encryption/live-code keys
+APP_MASTER_SECRET = get_secret("APP_MASTER_SECRET", "").strip()
+
+# Optional dedicated live-code secret
 LIVE_SECURITY_SECRET = get_secret("LIVE_SECURITY_SECRET", "").strip()
 
-def derive_fernet_key():
+def secure_equal(a, b):
+    return hmac.compare_digest(str(a), str(b))
+
+def derive_fallback_secret():
     """
-    Best practice: set APP_ENCRYPTION_KEY in Streamlit Secrets.
-    Fallback derives a stable key from ADMIN_PASSWORD so encrypted QR tokens
-    remain decryptable after app restarts.
+    Provides a stable fallback key without showing an encryption warning.
+    In production, APP_MASTER_SECRET or APP_ENCRYPTION_KEY is still recommended.
     """
+    base = APP_MASTER_SECRET or f"{ADMIN_PASSWORD}|{SCANNER_PASSWORD}|airnexus-secure-app"
+    return hashlib.sha256(base.encode("utf-8")).digest()
+
+def get_fernet():
     if APP_ENCRYPTION_KEY:
         try:
-            # Validate supplied Fernet key.
-            Fernet(APP_ENCRYPTION_KEY.encode())
-            return APP_ENCRYPTION_KEY.encode()
+            return Fernet(APP_ENCRYPTION_KEY.encode("utf-8"))
         except Exception:
             st.error("APP_ENCRYPTION_KEY in Streamlit Secrets is invalid.")
             st.stop()
 
-    digest = hashlib.sha256(("airnexus:" + ADMIN_PASSWORD).encode("utf-8")).digest()
-    return base64.urlsafe_b64encode(digest)
+    # Stable fallback derived from configured secrets.
+    key = base64.urlsafe_b64encode(derive_fallback_secret())
+    return Fernet(key)
 
-FERNET = Fernet(derive_fernet_key())
+FERNET = get_fernet()
 
 def get_live_secret_bytes():
     if LIVE_SECURITY_SECRET:
         return LIVE_SECURITY_SECRET.encode("utf-8")
-    return hashlib.sha256(("live:" + ADMIN_PASSWORD).encode("utf-8")).digest()
+    return hashlib.sha256(derive_fallback_secret() + b":live-code").digest()
 
 LIVE_SECRET = get_live_secret_bytes()
-
-def secure_equal(a, b):
-    return hmac.compare_digest(str(a), str(b))
 
 # ============================================================
 # DATABASE
@@ -87,8 +102,7 @@ def table_columns(conn, table_name):
     return {row["name"] for row in rows}
 
 def ensure_column(conn, table_name, column_name, definition):
-    cols = table_columns(conn, table_name)
-    if column_name not in cols:
+    if column_name not in table_columns(conn, table_name):
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 def init_db():
@@ -115,7 +129,6 @@ def init_db():
         """
     )
 
-    # Migrate earlier database versions safely.
     ensure_column(conn, "members", "photo", "BLOB")
     ensure_column(conn, "members", "qr_token_hash", "TEXT")
     ensure_column(conn, "members", "qr_token_enc", "TEXT")
@@ -156,10 +169,9 @@ def init_db():
 init_db()
 
 # ============================================================
-# QR TOKEN SECURITY
+# TOKEN SECURITY
 # ============================================================
 def new_qr_token():
-    # 32 random bytes encoded URL-safe. This is not guessable or sequential.
     return secrets.token_urlsafe(32)
 
 def hash_token(token):
@@ -200,7 +212,7 @@ def png_bytes(img):
     return buff.getvalue()
 
 # ============================================================
-# DATABASE HELPERS
+# DB HELPERS
 # ============================================================
 def add_audit(action, member_id=None, card_id=None, details=""):
     conn = get_connection()
@@ -209,13 +221,7 @@ def add_audit(action, member_id=None, card_id=None, details=""):
         INSERT INTO admin_audit(action, member_id, card_id, action_time, details)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (
-            action,
-            member_id,
-            card_id,
-            datetime.now().isoformat(timespec="seconds"),
-            details,
-        ),
+        (action, member_id, card_id, datetime.now().isoformat(timespec="seconds"), details),
     )
     conn.commit()
     conn.close()
@@ -309,19 +315,16 @@ def get_member_by_id(member_id):
     return dict(row) if row else None
 
 def get_member_by_token(token):
-    token_digest = hash_token(token)
     conn = get_connection()
     row = conn.execute(
         "SELECT * FROM members WHERE qr_token_hash=?",
-        (token_digest,),
+        (hash_token(token),),
     ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 def reissue_qr(member_id, card_id):
     token = new_qr_token()
-    digest = hash_token(token)
-    encrypted = encrypt_token(token)
     conn = get_connection()
     row = conn.execute(
         "SELECT COALESCE(issue_version, 1) AS issue_version FROM members WHERE id=?",
@@ -329,6 +332,7 @@ def reissue_qr(member_id, card_id):
     ).fetchone()
     next_version = int(row["issue_version"] or 1) + 1 if row else 2
 
+    now = datetime.now().isoformat(timespec="seconds")
     conn.execute(
         """
         UPDATE members
@@ -336,16 +340,11 @@ def reissue_qr(member_id, card_id):
             last_reissued_at=?, updated_at=?
         WHERE id=?
         """,
-        (
-            digest, encrypted, next_version,
-            datetime.now().isoformat(timespec="seconds"),
-            datetime.now().isoformat(timespec="seconds"),
-            member_id,
-        ),
+        (hash_token(token), encrypt_token(token), next_version, now, now, member_id),
     )
     conn.commit()
     conn.close()
-    add_audit("REISSUE_QR", member_id, card_id, f"QR token rotated to version {next_version}")
+    add_audit("REISSUE_QR", member_id, card_id, f"QR rotated to version {next_version}")
     return token
 
 def set_status(member_id, card_id, status):
@@ -376,16 +375,7 @@ def log_scan(member, verification_id, result):
     conn.commit()
     conn.close()
 
-def get_scan_count(member_id):
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT COUNT(*) AS c FROM scan_logs WHERE member_id=?",
-        (member_id,),
-    ).fetchone()
-    conn.close()
-    return int(row["c"]) if row else 0
-
-def get_recent_scans(limit=100):
+def get_recent_scans(limit=500):
     conn = get_connection()
     df = pd.read_sql_query(
         """
@@ -400,7 +390,7 @@ def get_recent_scans(limit=100):
     conn.close()
     return df
 
-def get_audit_log(limit=100):
+def get_audit_log(limit=500):
     conn = get_connection()
     df = pd.read_sql_query(
         """
@@ -416,7 +406,7 @@ def get_audit_log(limit=100):
     return df
 
 # ============================================================
-# VISUAL / CARD HELPERS
+# HELPERS
 # ============================================================
 def safe_text(value):
     if value is None:
@@ -425,14 +415,11 @@ def safe_text(value):
     return value if value else "-"
 
 def generate_card_id(category):
-    if category == "Executive Council":
-        prefix = "EC"
-    elif category == "Organizer":
-        prefix = "ORG"
-    elif category == "Volunteer":
-        prefix = "VOL"
-    else:
-        prefix = "ID"
+    prefix = {
+        "Executive Council": "EC",
+        "Organizer": "ORG",
+        "Volunteer": "VOL",
+    }.get(category, "ID")
     return f"AX-{prefix}-{secrets.token_hex(3).upper()}"
 
 def photo_image(photo_bytes):
@@ -452,15 +439,10 @@ def official_host():
         return APP_BASE_URL
 
 def live_security_code(member_id):
-    """
-    Rotating code changes every 30 seconds.
-    Useful against screenshots / stale verification pages.
-    """
     window = int(datetime.now().timestamp() // 30)
     msg = f"{member_id}:{window}".encode("utf-8")
     digest = hmac.new(LIVE_SECRET, msg, hashlib.sha256).hexdigest()
-    number = int(digest[:12], 16) % 1000000
-    return f"{number:06d}"
+    return f"{int(digest[:12], 16) % 1000000:06d}"
 
 def make_id_card(member, token):
     width, height = 1050, 650
@@ -510,47 +492,38 @@ def make_id_card(member, token):
     return card
 
 # ============================================================
+# SESSION STATE
+# ============================================================
+if "admin_authenticated" not in st.session_state:
+    st.session_state.admin_authenticated = False
+
+if "scanner_authenticated" not in st.session_state:
+    st.session_state.scanner_authenticated = False
+
+# ============================================================
 # CSS
 # ============================================================
 st.markdown(
     """
     <style>
-    .title {
-        font-size: 2.25rem;
-        font-weight: 800;
-        margin-bottom: 0.15rem;
-    }
-    .subtitle {
-        color: #666;
-        margin-bottom: 1rem;
-    }
+    .title {font-size:2.25rem;font-weight:800;margin-bottom:.15rem;}
+    .subtitle {color:#666;margin-bottom:1rem;}
     .verified-card {
-        border: 2px solid #1f8f4e;
-        background: #effbf3;
-        border-radius: 18px;
-        padding: 20px;
+        border:2px solid #1f8f4e;background:#effbf3;
+        border-radius:18px;padding:20px;
     }
     .danger-card {
-        border: 2px solid #b42318;
-        background: #fff3f2;
-        border-radius: 18px;
-        padding: 20px;
+        border:2px solid #b42318;background:#fff3f2;
+        border-radius:18px;padding:20px;
     }
     .live-code {
-        font-size: 2.2rem;
-        font-weight: 800;
-        letter-spacing: 0.3rem;
-        background: #111827;
-        color: white;
-        border-radius: 12px;
-        padding: 12px 18px;
-        display: inline-block;
+        font-size:2.2rem;font-weight:800;letter-spacing:.3rem;
+        background:#111827;color:white;border-radius:12px;
+        padding:12px 18px;display:inline-block;
     }
     .official-domain {
-        font-family: monospace;
-        background: #f0f2f6;
-        padding: 5px 8px;
-        border-radius: 7px;
+        font-family:monospace;background:#f0f2f6;
+        padding:5px 8px;border-radius:7px;
     }
     </style>
     """,
@@ -558,29 +531,60 @@ st.markdown(
 )
 
 # ============================================================
-# PUBLIC VERIFICATION MODE
+# PUBLIC QR / SCANNER AUTHENTICATION MODE
 # ============================================================
 verify_token = st.query_params.get("verify")
 
 if verify_token:
-    verification_id = f"V-{secrets.token_hex(4).upper()}"
-    member = get_member_by_token(verify_token)
-
-    st.markdown('<div class="title">🛡️ AirNexus Live Identity Verification</div>', unsafe_allow_html=True)
+    st.markdown('<div class="title">🛡️ AirNexus Secure QR Verification</div>', unsafe_allow_html=True)
     st.markdown(
         f'<div class="subtitle">Official verification host: '
         f'<span class="official-domain">{official_host()}</span></div>',
         unsafe_allow_html=True,
     )
 
+    # The QR page is locked until an authorized scanner enters the SCANNER_PASSWORD.
+    if not st.session_state.scanner_authenticated:
+        st.warning("Authorized event verification staff only.")
+        st.info(
+            "The QR code has been scanned successfully, but the identity result is protected. "
+            "Enter the separate Scanner Password to continue."
+        )
+
+        with st.form("scanner_login_form"):
+            scanner_password_input = st.text_input(
+                "Scanner Password",
+                type="password",
+                placeholder="Enter authorized scanner password",
+            )
+            scanner_login = st.form_submit_button(
+                "Unlock Verification",
+                use_container_width=True,
+            )
+
+        if scanner_login:
+            if secure_equal(scanner_password_input, SCANNER_PASSWORD):
+                st.session_state.scanner_authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect Scanner Password.")
+
+        st.caption("This password is separate from the administrator password.")
+        st.stop()
+
+    verification_id = f"V-{secrets.token_hex(4).upper()}"
+    member = get_member_by_token(verify_token)
+
     if not member:
         log_scan(None, verification_id, "INVALID_TOKEN")
         st.error("INVALID QR / IDENTITY NOT FOUND")
-        st.warning("Do not accept this card. The QR may be forged, expired, revoked, or incorrectly copied.")
+        st.warning("Do not accept this card.")
         st.write(f"Verification ID: `{verification_id}`")
+        if st.button("Lock Scanner", use_container_width=False):
+            st.session_state.scanner_authenticated = False
+            st.rerun()
         st.stop()
 
-    # Evaluate status and expiry.
     expiry_ok = True
     if member.get("expiry_date"):
         try:
@@ -592,6 +596,14 @@ if verify_token:
     result = "VERIFIED" if is_active else "NOT_AUTHORIZED"
     log_scan(member, verification_id, result)
 
+    top1, top2 = st.columns([4, 1])
+    with top1:
+        st.caption("Scanner session is unlocked for authorized staff.")
+    with top2:
+        if st.button("🔒 Lock Scanner", use_container_width=True):
+            st.session_state.scanner_authenticated = False
+            st.rerun()
+
     left, right = st.columns([1, 2])
 
     with left:
@@ -599,7 +611,7 @@ if verify_token:
         if pimg:
             st.image(pimg, caption="Official registered photograph", use_container_width=True)
         else:
-            st.warning("No official photograph is registered for this identity.")
+            st.warning("No official photograph is registered.")
 
     with right:
         box_class = "verified-card" if is_active else "danger-card"
@@ -623,45 +635,41 @@ if verify_token:
         st.markdown("</div>", unsafe_allow_html=True)
 
         st.write("")
-        st.markdown("### Live anti-screenshot code")
+        st.markdown("### Live Anti-Screenshot Code")
         st.markdown(
             f'<span class="live-code">{live_security_code(member["id"])}</span>',
             unsafe_allow_html=True,
         )
-        st.caption("This code changes approximately every 30 seconds. Refresh the page if checking a screenshot or stale page.")
+        st.caption("This code changes approximately every 30 seconds.")
 
         st.write(f"**Verification ID:** `{verification_id}`")
         st.write(f"**Verified at:** `{datetime.now().strftime('%d %b %Y, %I:%M:%S %p')}`")
         st.write(f"**QR issue version:** `{member.get('issue_version') or 1}`")
 
     st.info(
-        "Security check: compare the person with the official photo, confirm the Card ID printed on the physical card, "
-        "and make sure this page is opened on the official verification domain shown above."
+        "Compare the person with the official photo, confirm the physical Card ID, "
+        "and make sure this page is opened on the official verification domain."
     )
 
     if not is_active:
-        st.error(
-            "This identity is inactive, revoked, lost, or expired. Do not accept it for event access."
-        )
+        st.error("This identity is inactive, revoked, lost, or expired. Do not accept it.")
 
     st.stop()
 
 # ============================================================
 # ADMIN AUTHENTICATION
 # ============================================================
-if "admin_authenticated" not in st.session_state:
-    st.session_state.admin_authenticated = False
-
 with st.sidebar:
     st.header("🔐 Administration")
 
     if not st.session_state.admin_authenticated:
         admin_pw = st.text_input("Admin Password", type="password")
         totp_code = ""
+
         if ADMIN_TOTP_SECRET:
             totp_code = st.text_input("Authenticator Code", type="password", max_chars=6)
 
-        if st.button("Secure Login", use_container_width=True):
+        if st.button("Secure Admin Login", use_container_width=True):
             password_ok = secure_equal(admin_pw, ADMIN_PASSWORD)
             totp_ok = True
 
@@ -678,17 +686,17 @@ with st.sidebar:
                 st.error("Invalid administrator credentials.")
     else:
         st.success("Administrator authenticated")
-        if st.button("Logout", use_container_width=True):
+        if st.button("Logout Admin", use_container_width=True):
             st.session_state.admin_authenticated = False
             st.rerun()
 
     st.divider()
-    st.caption("QR scans never require administrator access.")
+    st.caption("Scanner access uses a separate password.")
 
 if not st.session_state.admin_authenticated:
     st.markdown('<div class="title">AirNexus Secure Identity Management</div>', unsafe_allow_html=True)
     st.info("Administrator login is required to manage identities.")
-    st.caption("Public QR verification works directly from the QR code.")
+    st.caption("Public QR verification is protected by a separate Scanner Password.")
     st.stop()
 
 # ============================================================
@@ -706,19 +714,19 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Total Identities", len(members_df))
 m2.metric("Active", int((members_df["status"] == "Active").sum()) if not members_df.empty else 0)
 m3.metric("Revoked / Lost", int(members_df["status"].isin(["Revoked", "Lost"]).sum()) if not members_df.empty else 0)
-m4.metric("Total Scans", len(get_recent_scans(100000)))
+m4.metric("Recent Scan Logs", len(get_recent_scans(500)))
 
 if ADMIN_PASSWORD == "admin123":
-    st.error("SECURITY WARNING: Change the default ADMIN_PASSWORD in Streamlit Secrets before real event use.")
+    st.error("SECURITY WARNING: Change the default ADMIN_PASSWORD in Streamlit Secrets.")
+
+if SCANNER_PASSWORD == "scanner123":
+    st.error("SECURITY WARNING: Change the default SCANNER_PASSWORD in Streamlit Secrets.")
+
+if secure_equal(ADMIN_PASSWORD, SCANNER_PASSWORD):
+    st.error("SECURITY WARNING: ADMIN_PASSWORD and SCANNER_PASSWORD must be different.")
 
 if not APP_BASE_URL:
     st.warning("APP_BASE_URL is not configured. Generated QR codes currently point to localhost.")
-
-if not APP_ENCRYPTION_KEY:
-    st.warning(
-        "APP_ENCRYPTION_KEY is not configured. The app is using a password-derived fallback key. "
-        "For production, set a dedicated Fernet key in Streamlit Secrets."
-    )
 
 tabs = st.tabs([
     "➕ Issue Identity",
@@ -767,18 +775,16 @@ with tabs[0]:
 
         submitted = st.form_submit_button("Issue Secure Identity", use_container_width=True)
 
-    # Keep normal/download buttons outside the form.
     if submitted:
         if not full_name.strip() or not position.strip():
             st.error("Full Name and Position are required.")
         elif photo_file is None:
-            st.error("An official photograph is required for secure identity verification.")
+            st.error("An official photograph is required.")
         else:
             member_id = str(uuid.uuid4())
             card_id = manual_card_id.strip() or generate_card_id(category)
             token = new_qr_token()
             now = datetime.now().isoformat(timespec="seconds")
-            photo_bytes = photo_file.getvalue()
 
             data = {
                 "id": member_id,
@@ -795,7 +801,7 @@ with tabs[0]:
                 "status": "Active",
                 "notes": notes.strip(),
                 "created_at": now,
-                "photo": photo_bytes,
+                "photo": photo_file.getvalue(),
                 "qr_token_hash": hash_token(token),
                 "qr_token_enc": encrypt_token(token),
                 "expiry_date": expiry_date.isoformat(),
@@ -837,7 +843,7 @@ with tabs[0]:
                     )
 
             except sqlite3.IntegrityError:
-                st.error("That Card ID already exists. Choose another Card ID.")
+                st.error("That Card ID already exists.")
 
 # ============================================================
 # TAB 2 - MANAGE
@@ -961,13 +967,12 @@ with tabs[1]:
                                 st.success("Record updated.")
                                 st.rerun()
                             except sqlite3.IntegrityError:
-                                st.error("That Card ID is already used by another identity.")
+                                st.error("That Card ID is already used.")
 
                 st.divider()
                 a1, a2, a3 = st.columns(3)
 
                 with a1:
-                    st.markdown("#### Immediate Revocation")
                     if st.button(
                         "Revoke Card",
                         key=f"revoke_{member['id']}",
@@ -975,14 +980,12 @@ with tabs[1]:
                         disabled=member["status"] == "Revoked",
                     ):
                         set_status(member["id"], member["card_id"], "Revoked")
-                        st.success("Identity revoked. Existing QR will show NOT AUTHORIZED.")
+                        st.success("Identity revoked.")
                         st.rerun()
 
                 with a2:
-                    st.markdown("#### Reissue QR")
-                    st.caption("Immediately invalidates all older printed/copied QR codes for this person.")
                     confirm_reissue = st.checkbox(
-                        "I understand the old QR will stop working",
+                        "Invalidate old QR and issue new one",
                         key=f"confirm_reissue_{member['id']}",
                     )
                     if st.button(
@@ -993,12 +996,12 @@ with tabs[1]:
                     ):
                         new_token = reissue_qr(member["id"], member["card_id"])
                         st.session_state[f"fresh_token_{member['id']}"] = new_token
-                        st.success("New QR issued. Old QR is now invalid.")
+                        st.success("New QR issued. Old QR is invalid.")
                         st.rerun()
 
                     fresh_token = st.session_state.get(f"fresh_token_{member['id']}")
                     if fresh_token:
-                        qi, qu = make_qr_from_token(fresh_token)
+                        qi, _ = make_qr_from_token(fresh_token)
                         st.image(qi, width=220)
                         st.download_button(
                             "Download Reissued QR",
@@ -1009,7 +1012,6 @@ with tabs[1]:
                         )
 
                 with a3:
-                    st.markdown("#### Permanent Delete")
                     confirm_delete = st.checkbox(
                         "Permanently delete this identity",
                         key=f"confirm_delete_{member['id']}",
@@ -1048,10 +1050,7 @@ with tabs[2]:
         token = decrypt_token(member.get("qr_token_enc"))
 
         if not token:
-            st.error(
-                "This record does not have a recoverable secure QR token. "
-                "Use 'Rotate / Reissue QR' in Manage to generate a fresh token."
-            )
+            st.error("No recoverable QR token. Reissue the QR from Manage.")
         else:
             qr_img, verify_url = make_qr_from_token(token)
             card_img = make_id_card(member, token)
@@ -1081,22 +1080,12 @@ with tabs[2]:
                     use_container_width=True,
                 )
 
-            st.warning(
-                "Printed QR codes can still be photographed. Security comes from live server verification, "
-                "registered photo comparison, official-domain checking, revocation, and QR rotation."
-            )
-
 # ============================================================
 # TAB 4 - SCAN LOGS
 # ============================================================
 with tabs[3]:
-    st.subheader("Live Verification Scan Log")
-    scans = get_recent_scans(500)
-    st.dataframe(scans, use_container_width=True, hide_index=True)
-    st.caption(
-        "Repeated or geographically impossible scans are indicators of possible credential copying. "
-        "This version records scans and verification IDs; location-based anomaly detection can be added later."
-    )
+    st.subheader("Verification Scan Log")
+    st.dataframe(get_recent_scans(500), use_container_width=True, hide_index=True)
 
 # ============================================================
 # TAB 5 - IMPORT / EXPORT
@@ -1118,10 +1107,6 @@ with tabs[4]:
 
     st.divider()
     st.markdown("### Bulk Import")
-    st.caption(
-        "For security, imported users are issued a fresh cryptographic QR token automatically. "
-        "Photos are not imported from CSV; add them afterward from Manage."
-    )
 
     template = pd.DataFrame(
         [{
@@ -1220,15 +1205,10 @@ with tabs[4]:
 # ============================================================
 with tabs[5]:
     st.subheader("Administrator Audit Trail")
-    audit = get_audit_log(500)
-    st.dataframe(audit, use_container_width=True, hide_index=True)
+    st.dataframe(get_audit_log(500), use_container_width=True, hide_index=True)
 
-# ============================================================
-# FOOTER
-# ============================================================
 st.divider()
 st.caption(
-    "Production note: Streamlit Community Cloud local SQLite storage is not guaranteed to be permanent. "
-    "For the live event, move the database and photo storage to a persistent service such as Supabase/PostgreSQL. "
-    "The security controls in this version still improve QR forgery resistance, revocation, auditability, and live verification."
+    "Production note: Streamlit Community Cloud local SQLite storage is not guaranteed permanent. "
+    "For the live event, move the database and photo storage to persistent PostgreSQL/Supabase."
 )
