@@ -36,23 +36,24 @@ DSA_LOGO_B64 = """iVBORw0KGgoAAAANSUhEUgAAAOMAAADeCAYAAADParc/AAAAAXNSR0IArs4c6Q
 
 
 def branded_header(title, subtitle=""):
+    # Keep HTML flush-left so Streamlit renders it as HTML, not as a code block.
+    header_html = (
+        f'<div class="airnexus-header">'
+        f'<div class="logo-box">'
+        f'<img src="data:image/png;base64,{AU_LOGO_B64}" class="header-logo au-logo">'
+        f'</div>'
+        f'<div class="header-center">'
+        f'<div class="header-title">{title}</div>'
+        f'<div class="header-subtitle">{subtitle}</div>'
+        f'</div>'
+        f'<div class="logo-box">'
+        f'<img src="data:image/png;base64,{DSA_LOGO_B64}" class="header-logo dsa-logo">'
+        f'</div>'
+        f'</div>'
+    )
+
     st.markdown(
-        f"""
-        <div class="airnexus-header">
-            <div class="logo-box">
-                <img src="data:image/png;base64,{AU_LOGO_B64}" class="header-logo au-logo">
-            </div>
-
-            <div class="header-center">
-                <div class="header-title">{title}</div>
-                <div class="header-subtitle">{subtitle}</div>
-            </div>
-
-            <div class="logo-box">
-                <img src="data:image/png;base64,{DSA_LOGO_B64}" class="header-logo dsa-logo">
-            </div>
-        </div>
-        """,
+        header_html,
         unsafe_allow_html=True,
     )
 
